@@ -599,7 +599,19 @@ def _get_cipher_grade(cipher_name: str) -> str:
 def calculate_pqc_score(scan_result: dict) -> dict:
     """
     Full 40-parameter PQC readiness scoring.
-    Starting at 100, deductions applied per finding.
+    Scoring model: start at 100, apply deductions for weaknesses, apply
+    bonuses for post-quantum-safe and strong classical choices.
+    Calibration rationale:
+      - RSA-2048 penalty reduced: 128-bit quantum equivalent is the NIST
+        symmetric target — penalise it, but not as harshly as truly broken keys.
+      - Strong symmetric (AES-256, ChaCha20, GCM) now award score, not just
+        appear in the positives log — good classical hygiene is rewarded.
+      - TLS 1.2 penalty eased: still penalised vs 1.3, but a well-configured
+        1.2 endpoint should sit in Transitioning, not Vulnerable.
+      - No-FS stacking reduced so RC4/3DES sites land at ~5-15 rather than 0.
+      - PQC bonuses raised to give genuine differentiation when ML-KEM/ML-DSA
+        are deployed.
+      - Thresholds shifted: PQC Ready at >=62 (was 65), Transitioning at >=37.
     """
     score = 100
     issues = []
@@ -624,21 +636,21 @@ def calculate_pqc_score(scan_result: dict) -> dict:
     if "1.3" in tls_version:
         positives.append("TLS 1.3 — modern protocol with mandatory forward secrecy")
     elif "1.2" in tls_version:
-        score -= 12
+        score -= 8                                                   # was -12
         issues.append({"severity":"MEDIUM","issue":"TLS 1.2 in use — sessions vulnerable to HNDL recording","action":"Enforce TLS 1.3 minimum"})
     elif "1.1" in tls_version:
-        score -= 35
+        score -= 30                                                  # was -35
         issues.append({"severity":"CRITICAL","issue":"TLS 1.1 — deprecated RFC 8996, vulnerable to BEAST/POODLE","action":"Immediately disable TLS 1.1"})
     elif "1.0" in tls_version:
-        score -= 40
+        score -= 35                                                  # was -40
         issues.append({"severity":"CRITICAL","issue":"TLS 1.0 — deprecated RFC 8996, vulnerable to BEAST/POODLE/CRIME","action":"Immediately disable TLS 1.0"})
 
     # Servers accepting legacy TLS versions
     if "TLSv1.0" in supported_vers:
-        score -= 12
+        score -= 10                                                  # was -12
         issues.append({"severity":"HIGH","issue":"Server still accepts TLS 1.0 connections","action":"Disable TLS 1.0 in server config"})
     if "TLSv1.1" in supported_vers:
-        score -= 8
+        score -= 5                                                   # was -8
         issues.append({"severity":"HIGH","issue":"Server still accepts TLS 1.1 connections","action":"Disable TLS 1.1 in server config"})
     if "TLSv1.2" in supported_vers and "TLSv1.3" in supported_vers:
         issues.append({"severity":"LOW","issue":"TLS 1.2 accepted alongside TLS 1.3","action":"Consider disabling TLS 1.2 for stricter posture"})
@@ -646,93 +658,96 @@ def calculate_pqc_score(scan_result: dict) -> dict:
     # ── Certificate Key Type & Size ───────────────────────────────────────────
     if cert_key_type == "RSA":
         if cert_key_bits < 1024:
-            score -= 55
+            score -= 50                                              # was -55
             issues.append({"severity":"CRITICAL","issue":f"RSA-{cert_key_bits} — trivially broken, below all security minimums","action":"Replace with ML-DSA-65 (FIPS 204) immediately"})
         elif cert_key_bits < 2048:
-            score -= 45
+            score -= 40                                              # was -45
             issues.append({"severity":"CRITICAL","issue":f"RSA-{cert_key_bits} — below 2048-bit minimum, easily broken classically","action":"Replace with ML-DSA-65 (FIPS 204)"})
         elif cert_key_bits < 3072:
-            score -= 28
+            score -= 20                                              # was -28 — RSA-2048 is the industry baseline; penalise but don't bury it
             issues.append({"severity":"HIGH","issue":f"RSA-{cert_key_bits} — fully broken by Shor's algorithm; key size irrelevant against quantum","action":"Migrate to ML-DSA-65 (FIPS 204)"})
         elif cert_key_bits < 4096:
-            score -= 25
+            score -= 18                                              # was -25
             issues.append({"severity":"HIGH","issue":f"RSA-{cert_key_bits} — larger key still fully broken by Shor's algorithm","action":"Migrate to ML-DSA-65 (FIPS 204)"})
         else:
-            score -= 20
+            score -= 12                                              # was -20
             issues.append({"severity":"HIGH","issue":f"RSA-{cert_key_bits} — even 4096-bit RSA is fully broken by Shor's algorithm","action":"Migrate to ML-DSA-65 (FIPS 204)"})
     elif cert_key_type in ["EC","ECDSA"]:
-        score -= 22
+        score -= 18                                                  # was -22
         issues.append({"severity":"HIGH","issue":f"ECDSA-{cert_key_bits} — elliptic curve fully broken by Shor's algorithm","action":"Migrate to ML-DSA-65 (FIPS 204)"})
     elif cert_key_type == "DSA":
-        score -= 38
+        score -= 35                                                  # was -38
         issues.append({"severity":"CRITICAL","issue":"DSA — NIST-deprecated, classically weak, quantum-broken","action":"Replace with ML-DSA-65 (FIPS 204) immediately"})
     elif cert_key_type == "Ed25519":
-        score -= 20
+        score -= 14                                                  # was -20
         issues.append({"severity":"MEDIUM","issue":"Ed25519 — quantum-vulnerable (Shor's breaks discrete log)","action":"Plan migration to ML-DSA-65 (FIPS 204)"})
     elif "ML-DSA" in cert_key_type or "SLH-DSA" in cert_key_type:
         positives.append(f"PQC certificate: {cert_key_type} — fully quantum-resistant signature (NIST standardized)")
-        score += 8
+        score += 10                                                  # was +8
 
     # ── Key Exchange ──────────────────────────────────────────────────────────
     if "ML-KEM" in key_exchange and "Safe" in key_exchange:
         positives.append(f"ML-KEM quantum-safe key exchange deployed (FIPS 203)")
-        score += 8
+        score += 10                                                  # was +8
     elif "Hybrid" in key_exchange or "Kyber" in key_exchange:
         positives.append(f"Hybrid PQC key exchange: {key_exchange} — transitional quantum protection")
-        score += 4
+        score += 5                                                   # was +4
     elif "no forward" in key_exchange.lower():
-        score -= 22
+        score -= 15                                                  # was -22
         issues.append({"severity":"CRITICAL","issue":"RSA key exchange — no forward secrecy, all sessions decryptable if private key compromised","action":"Migrate to ECDHE or ML-KEM-768"})
     elif "Quantum-Vulnerable" in key_exchange:
-        score -= 10
+        score -= 8                                                   # was -10
         issues.append({"severity":"MEDIUM","issue":f"{key_exchange} — vulnerable to Shor's algorithm, enables HNDL attacks","action":"Deploy ML-KEM-768 (FIPS 203) or X25519+ML-KEM hybrid"})
 
     # ── Forward Secrecy ───────────────────────────────────────────────────────
     if forward_secrecy:
         positives.append("Forward secrecy enabled — past sessions protected even if key is later compromised")
     else:
-        score -= 15
+        score -= 10                                                  # was -15
         issues.append({"severity":"HIGH","issue":"No forward secrecy — compromise of long-term key decrypts ALL past sessions","action":"Use ECDHE or DHE key exchange to enable forward secrecy"})
 
     # ── Symmetric Cipher ─────────────────────────────────────────────────────
     cu = cipher.upper()
     if "RC4" in cu:
-        score -= 38
+        score -= 30                                                  # was -38
         issues.append({"severity":"CRITICAL","issue":"RC4 — broken by classical statistical attacks (RFC 7465), trivially broken quantumly","action":"Disable RC4 immediately"})
     elif "NULL" in cu:
-        score -= 50
+        score -= 42                                                  # was -50
         issues.append({"severity":"CRITICAL","issue":"NULL cipher — NO encryption, data transmitted in plaintext","action":"Disable NULL cipher suites immediately"})
     elif "3DES" in cu or "DES-CBC3" in cu:
-        score -= 32
+        score -= 26                                                  # was -32
         issues.append({"severity":"CRITICAL","issue":"3DES — SWEET32 birthday attack (CVE-2016-2183), Grover's reduces to ~40-bit quantum security","action":"Disable 3DES, use AES-256-GCM"})
     elif "DES" in cu and "3DES" not in cu:
-        score -= 40
+        score -= 36                                                  # was -40
         issues.append({"severity":"CRITICAL","issue":"DES — 56-bit key, broken since 1997, zero quantum resistance","action":"Disable DES immediately"})
     elif "AES_128" in cu or "AES-128" in cu or "AES128" in cu:
-        score -= 8
+        score -= 6                                                   # was -8
         issues.append({"severity":"MEDIUM","issue":"AES-128 — Grover's algorithm reduces to ~64-bit effective security, below NIST PQ threshold","action":"Switch to AES-256-GCM"})
     elif "AES_256" in cu or "AES-256" in cu or "AES256" in cu:
         positives.append("AES-256 — Grover's reduces to ~128-bit, meets NIST post-quantum symmetric requirement")
+        score += 3                                                   # NEW: reward meeting PQ symmetric target
     elif "CHACHA20" in cu:
         positives.append("ChaCha20-Poly1305 — 256-bit symmetric, meets NIST post-quantum symmetric requirement")
+        score += 3                                                   # NEW: reward meeting PQ symmetric target
 
     # Cipher mode
     if "GCM" in cu:
         positives.append("GCM (Galois/Counter Mode) — authenticated encryption, resistant to padding attacks")
+        score += 2                                                   # NEW: AEAD mode is meaningfully better than MAC-then-encrypt
     elif "CBC" in cu:
-        score -= 5
+        score -= 4                                                   # was -5
         issues.append({"severity":"LOW","issue":"CBC mode — vulnerable to BEAST/LUCKY13 timing attacks without careful implementation","action":"Prefer GCM or ChaCha20-Poly1305"})
 
     # ── Cipher Grade ──────────────────────────────────────────────────────────
     if cipher_grade == "F":
         issues.append({"severity":"CRITICAL","issue":f"Cipher suite grade F — critically weak or broken cipher in use","action":"Replace with a grade-A cipher suite"})
     elif cipher_grade == "D":
-        score -= 10
+        score -= 8                                                   # was -10
         issues.append({"severity":"HIGH","issue":"Cipher suite grade D — deprecated cipher with weak parameters","action":"Upgrade to AES-256-GCM or ChaCha20-Poly1305"})
 
     # ── Signature Algorithm ───────────────────────────────────────────────────
     if "SHA1" in sig_algo or "MD5" in sig_algo:
-        score -= 20
+        score -= 18                                                  # was -20
         issues.append({"severity":"CRITICAL","issue":f"Certificate signed with {sig_algo} — collision attacks possible, deprecated by all CAs","action":"Obtain new certificate with SHA-256 or SHA-384 signature"})
     elif "SHA256" in sig_algo:
         positives.append("SHA-256 signature algorithm — classically secure, acceptable post-quantum")
@@ -741,38 +756,40 @@ def calculate_pqc_score(scan_result: dict) -> dict:
 
     # ── Certificate Health ────────────────────────────────────────────────────
     if days_to_expiry < 0:
-        score -= 30
+        score -= 25                                                  # was -30
         issues.append({"severity":"CRITICAL","issue":f"Certificate expired {abs(days_to_expiry)} days ago","action":"Replace certificate immediately"})
     elif days_to_expiry < 14:
-        score -= 20
+        score -= 16                                                  # was -20
         issues.append({"severity":"CRITICAL","issue":f"Certificate expires in {days_to_expiry} days","action":"Renew certificate immediately"})
     elif days_to_expiry < 30:
-        score -= 10
+        score -= 8                                                   # was -10
         issues.append({"severity":"HIGH","issue":f"Certificate expires in {days_to_expiry} days","action":"Schedule certificate renewal now"})
     elif days_to_expiry < 90:
         issues.append({"severity":"MEDIUM","issue":f"Certificate expires in {days_to_expiry} days","action":"Plan certificate renewal in the next 30 days"})
 
     if is_self_signed:
-        score -= 15
+        score -= 12                                                  # was -15
         issues.append({"severity":"HIGH","issue":"Self-signed certificate — not trusted by browsers, no CA accountability","action":"Replace with certificate from a trusted CA"})
 
     if not has_ct:
-        score -= 5
+        score -= 3                                                   # was -5
         issues.append({"severity":"MEDIUM","issue":"No Certificate Transparency SCTs — certificate not CT-logged, Chrome may reject it","action":"Ensure certificate is logged in CT servers"})
 
     # ── HTTP Security ─────────────────────────────────────────────────────────
     if not has_hsts:
-        score -= 8
+        score -= 6                                                   # was -8
         issues.append({"severity":"HIGH","issue":"No HSTS header — clients may connect over insecure HTTP first","action":"Add Strict-Transport-Security: max-age=31536000; includeSubDomains; preload"})
 
     # ── Final Score ───────────────────────────────────────────────────────────
     score = max(0, min(100, score))
 
+    # Thresholds adjusted: PQC_READY lowered to 62 (good classical+TLS1.3 lands here),
+    # TRANSITIONING lowered to 37 (good TLS1.2 sites clear this comfortably).
     if score >= 85:
         status, label, badge_color = "QUANTUM_SAFE",    "Fully Quantum Safe",         "#00C853"
-    elif score >= 65:
+    elif score >= 62:                                                # was 65
         status, label, badge_color = "PQC_READY",       "PQC Ready (Partial)",        "#FFD600"
-    elif score >= 40:
+    elif score >= 37:                                                # was 40
         status, label, badge_color = "TRANSITIONING",   "Quantum Transition Required","#FF6D00"
     else:
         status, label, badge_color = "VULNERABLE",      "Quantum Vulnerable",         "#D50000"
